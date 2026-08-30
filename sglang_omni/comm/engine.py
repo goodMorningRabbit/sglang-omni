@@ -74,6 +74,19 @@ class PendingTransfer(msgspec.Struct):
     cleanup_requested: bool = False
 
 
+def pending_transfer_bytes(pending: PendingTransfer) -> int:
+    total = 0
+    for op in pending.ops:
+        try:
+            size = op.metadata["transfer_info"]["size"]
+        except Exception:
+            return -1
+        if type(size) is not int or size < 0:
+            return -1
+        total += size
+    return total
+
+
 class PayloadSendJob(msgspec.Struct, frozen=True):
     relay: Relay
     control_plane: stage_io.StageMessageSender
@@ -1193,6 +1206,7 @@ class CommEngine:
 
     async def watch_pending(self, object_id: str, pending: PendingTransfer) -> bool:
         retained = False
+        watch_start = _comm_now_ns() if _comm_trace_enabled() else None
         try:
             ack = (
                 asyncio.shield(pending.ack)
@@ -1206,6 +1220,7 @@ class CommEngine:
                 await op.wait_for_completion(timeout=self.ack_timeout_s)
             return pending.cleanup_requested
         except asyncio.CancelledError as exc:
+            self.trace_pending_failure(object_id, pending, exc, watch_start)
             if pending.retain_pending_on_failure and not pending.receiver_terminal:
                 # A local failure is not proof that the peer stopped reading.
                 self.retain_pending_kv_transfer(object_id, pending, exc)
@@ -1214,6 +1229,7 @@ class CommEngine:
                 pass
             raise
         except Exception as exc:
+            self.trace_pending_failure(object_id, pending, exc, watch_start)
             if pending.retain_pending_on_failure and not pending.receiver_terminal:
                 self.retain_pending_kv_transfer(object_id, pending, exc)
                 retained = True
@@ -1241,6 +1257,24 @@ class CommEngine:
             else:
                 pass
 
+    def trace_pending_failure(
+        self,
+        object_id: str,
+        pending: PendingTransfer,
+        error: BaseException,
+        watch_start: int | None,
+    ) -> None:
+        if watch_start is None or not _comm_trace_enabled():
+            return
+        _comm_trace(
+            "comm_transfer_failed",
+            object_id=object_id,
+            num_ops=len(pending.ops),
+            error=type(error).__name__,
+            timeout_s=self.ack_timeout_s,
+            elapsed_ms=round(_comm_elapsed_ms(watch_start), 6),
+        )
+
     def retain_pending_kv_transfer(
         self,
         object_id: str,
@@ -1254,6 +1288,7 @@ class CommEngine:
             object_id=object_id,
             retained_count=len(self.retained_pending_kv_transfers),
             num_ops=len(pending.ops),
+            bytes=pending_transfer_bytes(pending),
             error=type(error).__name__,
         )
         logger.error(
