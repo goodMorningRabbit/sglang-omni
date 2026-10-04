@@ -34,6 +34,7 @@ from sglang_omni.pipeline.control_plane import PullSocket, PushSocket, send_to_e
 from sglang_omni.platforms import current_platform
 from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
 from sglang_omni.profiler.comm_trace import emit as _comm_trace
+from sglang_omni.profiler.comm_trace import enabled as _comm_trace_enabled
 from sglang_omni.profiler.comm_trace import now_ns as _comm_now_ns
 from sglang_omni.proto import (
     DataAckMessage,
