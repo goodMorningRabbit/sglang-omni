@@ -885,11 +885,16 @@ class CudaIpcRelay(Relay):
     ) -> None:
         self.stranded_slots_total += num_slots
         self.mark_failed(error)
+        self.emit_pool_state(allocator)
+
+    def emit_pool_state(self, allocator: ContiguousSlotAllocator) -> None:
         if _comm_trace_enabled():
             try:
                 layout = allocator.snapshot_layout()
                 _comm_trace(
                     "cuda_ipc_pool_state",
+                    engine_id=self.engine_id,
+                    device=self.device,
                     free_slots=layout.free_slots,
                     largest_free_run=layout.largest_free_run,
                     stranded_slots_total=self.stranded_slots_total,
@@ -1489,6 +1494,10 @@ class CudaIpcRelay(Relay):
         pass
 
     def close(self) -> None:
+        if self.allocator is not None:
+            self.emit_pool_state(self.allocator)
+        else:
+            pass
         self.remote_pools.clear()
         self.remote_kv_pools.clear()
         self.kv_pool_storage_handles.clear()
