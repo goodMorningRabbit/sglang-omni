@@ -102,6 +102,33 @@ def test_cuda_ipc_relay_traces_pool_state_when_slots_are_stranded(
 
     pool_state = [event for event in events if event["event"] == "cuda_ipc_pool_state"]
     assert len(pool_state) == 1
+    assert pool_state[0]["engine_id"] == "sender"
+    assert pool_state[0]["device"] == "cuda:0"
+    assert pool_state[0]["free_slots"] == 2
+    assert pool_state[0]["largest_free_run"] == 2
+    assert pool_state[0]["stranded_slots_total"] == 2
+
+
+def test_cuda_ipc_relay_traces_final_pool_state_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+    allocator = ContiguousSlotAllocator(slot_count=4, slot_size=8)
+
+    async def reserve_slots() -> None:
+        await allocator.acquire_async(2)
+
+    asyncio.run(reserve_slots())
+    relay.allocator = allocator
+    relay.stranded_slots_total = 2
+
+    with capture_comm_trace(monkeypatch) as events:
+        relay.close()
+
+    pool_state = [event for event in events if event["event"] == "cuda_ipc_pool_state"]
+    assert len(pool_state) == 1
+    assert pool_state[0]["engine_id"] == "sender"
+    assert pool_state[0]["device"] == "cuda:0"
     assert pool_state[0]["free_slots"] == 2
     assert pool_state[0]["largest_free_run"] == 2
     assert pool_state[0]["stranded_slots_total"] == 2

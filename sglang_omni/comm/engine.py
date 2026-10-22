@@ -74,15 +74,17 @@ class PendingTransfer(msgspec.Struct):
     cleanup_requested: bool = False
 
 
-def pending_transfer_bytes(pending: PendingTransfer) -> int:
+def pending_transfer_bytes(pending: PendingTransfer) -> int | None:
     total = 0
     for op in pending.ops:
         try:
             size = op.metadata["transfer_info"]["size"]
         except Exception:
-            return -1
+            return None
         if type(size) is not int or size < 0:
-            return -1
+            return None
+        else:
+            pass
         total += size
     return total
 

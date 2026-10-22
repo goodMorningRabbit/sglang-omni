@@ -55,16 +55,16 @@ class AckedOp:
     [
         ([], 0),
         ([{"transfer_info": {"size": 3}}, {"transfer_info": {"size": 5}}], 8),
-        ([{}], -1),
-        ([{"transfer_info": {}}], -1),
-        ([{"transfer_info": {"size": -1}}], -1),
-        ([{"transfer_info": {"size": True}}], -1),
-        ([{"transfer_info": {"size": 1.5}}], -1),
+        ([{}], None),
+        ([{"transfer_info": {}}], None),
+        ([{"transfer_info": {"size": -1}}], None),
+        ([{"transfer_info": {"size": True}}], None),
+        ([{"transfer_info": {"size": 1.5}}], None),
     ],
 )
 def test_pending_transfer_bytes(
     op_metadata: list[dict[str, Any]],
-    expected: int,
+    expected: int | None,
 ) -> None:
     pending = PendingTransfer(
         ops=[AckedOp(metadata) for metadata in op_metadata],
