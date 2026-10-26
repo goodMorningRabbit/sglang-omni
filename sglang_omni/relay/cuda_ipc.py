@@ -361,12 +361,19 @@ class ReceiverAckOperation(RelayOperation):
 
 
 class CudaIpcPutOperation(ReceiverAckOperation):
-    """Sender-side handle; completion means the slot can be reused."""
+    """Sender-side handle that owns its slots until the receiver acknowledges.
+
+    Cancellation is traced once but does not release the slots, clear the held CUDA
+    references, or fail the relay. This preserves the existing reclamation policy
+    because cancellation does not prove that the receiver stopped reading.
+    """
 
     def __init__(
         self,
         metadata: dict[str, str | dict[str, int] | CudaPoolInfo],
         *,
+        engine_id: str,
+        device: str,
         ready_event: torch.cuda.Event,
         source_tensor: torch.Tensor,
         slot_index: int,
@@ -374,11 +381,14 @@ class CudaIpcPutOperation(ReceiverAckOperation):
         size: int,
         release_cb: Callable[[], None],
         fail_cb: Callable[[BaseException], None],
+        cancel_callback: Callable[[BaseException], None],
         num_slots: int = 1,
         copy_start_event: torch.cuda.Event | None = None,
         copy_done_event: torch.cuda.Event | None = None,
     ) -> None:
         super().__init__(metadata)
+        self.engine_id = engine_id
+        self.device = device
         self.ready_event: torch.cuda.Event | None = ready_event
         self.copy_start_event = copy_start_event
         self.copy_done_event = copy_done_event
@@ -389,7 +399,9 @@ class CudaIpcPutOperation(ReceiverAckOperation):
         self.size = size
         self.release_cb = release_cb
         self.fail_cb = fail_cb
+        self.cancel_callback = cancel_callback
         self.completed = False
+        self.has_traced_cancellation = False
 
     async def wait_for_completion(self, timeout: float = 30.0) -> None:
         if self.completed:
@@ -399,23 +411,21 @@ class CudaIpcPutOperation(ReceiverAckOperation):
         wait_start = _comm_now_ns()
         try:
             await self.wait_for_receiver(timeout)
+        except asyncio.CancelledError as exc:
+            if not self.has_traced_cancellation:
+                self.has_traced_cancellation = True
+                self.trace_stranded_slots(exc)
+                self.cancel_callback(exc)
+            else:
+                pass
+            raise
         except TimeoutError as exc:
-            self.completed = True
-            self.trace_stranded_slots(exc)
+            self.finish_with_stranded_slots(exc)
             self.fail_cb(exc)
-            self.source_tensor = None
-            self.ready_event = None
-            self.copy_start_event = None
-            self.copy_done_event = None
             raise
         except Exception as exc:
-            self.completed = True
-            self.trace_stranded_slots(exc)
+            self.finish_with_stranded_slots(exc)
             self.fail_cb(exc)
-            self.source_tensor = None
-            self.ready_event = None
-            self.copy_start_event = None
-            self.copy_done_event = None
             raise
         self.completed = True
         self.release_cb()
@@ -445,9 +455,19 @@ class CudaIpcPutOperation(ReceiverAckOperation):
             pass
         _comm_trace("cuda_ipc_put_wait_ack", **trace_fields)
 
+    def finish_with_stranded_slots(self, error: BaseException) -> None:
+        self.completed = True
+        self.trace_stranded_slots(error)
+        self.source_tensor = None
+        self.ready_event = None
+        self.copy_start_event = None
+        self.copy_done_event = None
+
     def trace_stranded_slots(self, error: BaseException) -> None:
         _comm_trace(
             "cuda_ipc_slots_stranded",
+            engine_id=self.engine_id,
+            device=self.device,
             request_id=self.request_id,
             slot_index=self.slot_index,
             num_slots=self.num_slots,
@@ -882,9 +902,13 @@ class CudaIpcRelay(Relay):
         allocator: ContiguousSlotAllocator,
         num_slots: int,
         error: BaseException,
+        mark_relay_failed: bool = True,
     ) -> None:
         self.stranded_slots_total += num_slots
-        self.mark_failed(error)
+        if mark_relay_failed:
+            self.mark_failed(error)
+        else:
+            pass
         self.emit_pool_state(allocator)
 
     def emit_pool_state(self, allocator: ContiguousSlotAllocator) -> None:
@@ -901,6 +925,8 @@ class CudaIpcRelay(Relay):
                 )
             except Exception:
                 logger.exception("Failed to trace stranded CUDA-IPC pool state")
+        else:
+            pass
 
     def raise_if_failed(self) -> None:
         if self.failed_error is not None:
@@ -1084,6 +1110,8 @@ class CudaIpcRelay(Relay):
         }
         return CudaIpcPutOperation(
             metadata,
+            engine_id=self.engine_id,
+            device=self.device,
             ready_event=ready_event,
             source_tensor=flat,
             slot_index=slot_index,
@@ -1093,6 +1121,12 @@ class CudaIpcRelay(Relay):
             release_cb=lambda: allocator.release(offset, num_slots),
             fail_cb=lambda error: self.record_stranded_slots(
                 allocator, num_slots, error
+            ),
+            cancel_callback=lambda error: self.record_stranded_slots(
+                allocator,
+                num_slots,
+                error,
+                mark_relay_failed=False,
             ),
             copy_start_event=copy_start_event,
             copy_done_event=copy_done_event,

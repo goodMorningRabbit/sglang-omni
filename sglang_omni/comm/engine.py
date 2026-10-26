@@ -32,9 +32,9 @@ from sglang_omni.comm.kv_transfer import (
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.control_plane import PullSocket, PushSocket, send_to_endpoint
 from sglang_omni.platforms import current_platform
-from sglang_omni.profiler.comm_trace import enabled as _comm_trace_enabled
 from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
 from sglang_omni.profiler.comm_trace import emit as _comm_trace
+from sglang_omni.profiler.comm_trace import enabled as _comm_trace_enabled
 from sglang_omni.profiler.comm_trace import now_ns as _comm_now_ns
 from sglang_omni.proto import (
     DataAckMessage,
@@ -1269,6 +1269,8 @@ class CommEngine:
     ) -> None:
         if watch_start is None or not _comm_trace_enabled():
             return
+        else:
+            pass
         _comm_trace(
             "comm_transfer_failed",
             object_id=object_id,
@@ -1286,14 +1288,17 @@ class CommEngine:
     ) -> None:
         self.pending.pop(object_id, None)
         self.retained_pending_kv_transfers.append(pending)
-        _comm_trace(
-            "comm_kv_pending_retained",
-            object_id=object_id,
-            retained_count=len(self.retained_pending_kv_transfers),
-            num_ops=len(pending.ops),
-            bytes=pending_transfer_bytes(pending),
-            error=type(error).__name__,
-        )
+        if _comm_trace_enabled():
+            _comm_trace(
+                "comm_kv_pending_retained",
+                object_id=object_id,
+                retained_count=len(self.retained_pending_kv_transfers),
+                num_ops=len(pending.ops),
+                bytes=pending_transfer_bytes(pending),
+                error=type(error).__name__,
+            )
+        else:
+            pass
         logger.error(
             "Retaining pending KV transfer %s after sender failure: %s",
             object_id,

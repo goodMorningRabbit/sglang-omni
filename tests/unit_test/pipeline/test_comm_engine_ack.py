@@ -10,11 +10,7 @@ import pytest
 import torch
 
 from sglang_omni.comm.data_ref import DataRef, TransportKind
-from sglang_omni.comm.engine import (
-    CommEngine,
-    PendingTransfer,
-    pending_transfer_bytes,
-)
+from sglang_omni.comm.engine import CommEngine, PendingTransfer, pending_transfer_bytes
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.proto import DataAckMessage, DataReadyMessage
 from tests.unit_test.fixtures.pipeline_fakes import (
@@ -72,6 +68,44 @@ def test_pending_transfer_bytes(
     )
 
     assert pending_transfer_bytes(pending) == expected
+
+
+def test_retain_pending_skips_byte_aggregation_when_tracing_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aggregate_bytes = Mock(side_effect=AssertionError("unexpected byte aggregation"))
+    monkeypatch.delenv("SGLANG_OMNI_COMM_TRACE", raising=False)
+    monkeypatch.setattr(
+        "sglang_omni.comm.engine.pending_transfer_bytes",
+        aggregate_bytes,
+    )
+
+    async def run() -> None:
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+            )
+        )
+        pending = PendingTransfer(
+            ops=[AckedOp({"transfer_info": {"size": 1}})],
+            ack=asyncio.get_running_loop().create_future(),
+        )
+        engine.pending["transfer"] = pending
+
+        engine.retain_pending_kv_transfer(
+            "transfer",
+            pending,
+            TimeoutError("ack timeout"),
+        )
+
+        assert "transfer" not in engine.pending
+        assert engine.retained_pending_kv_transfers == [pending]
+
+    asyncio.run(run())
+    aggregate_bytes.assert_not_called()
 
 
 class AckedRelay:

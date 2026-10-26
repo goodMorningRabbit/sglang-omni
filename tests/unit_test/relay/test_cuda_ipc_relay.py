@@ -60,6 +60,8 @@ def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot(
     async def run() -> None:
         op = CudaIpcPutOperation(
             metadata={},
+            engine_id="sender",
+            device="cuda:0",
             ready_event=object(),  # type: ignore[arg-type]
             source_tensor=object(),  # type: ignore[arg-type]
             slot_index=0,
@@ -67,6 +69,7 @@ def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot(
             size=1,
             release_cb=release,
             fail_cb=failed.append,
+            cancel_callback=failed.append,
         )
         with pytest.raises(TimeoutError):
             await op.wait_for_completion(timeout=0.0)
@@ -81,11 +84,83 @@ def test_cuda_ipc_put_timeout_fails_relay_without_releasing_slot(
         event for event in events if event["event"] == "cuda_ipc_slots_stranded"
     ]
     assert len(stranded) == 1
+    assert stranded[0]["engine_id"] == "sender"
+    assert stranded[0]["device"] == "cuda:0"
     assert stranded[0]["request_id"] == "r"
     assert stranded[0]["slot_index"] == 0
     assert stranded[0]["num_slots"] == 1
     assert stranded[0]["bytes"] == 1
     assert stranded[0]["reason"] == "TimeoutError"
+
+
+def test_cuda_ipc_put_cancellation_traces_slot_without_releasing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+    allocator = ContiguousSlotAllocator(slot_count=4, slot_size=8)
+    ready_event = object()
+    source_tensor = object()
+
+    async def run() -> CudaIpcPutOperation:
+        num_slots = 2
+        allocation = await allocator.acquire_async(num_slots)
+        operation = CudaIpcPutOperation(
+            metadata={},
+            engine_id="sender",
+            device="cuda:0",
+            ready_event=ready_event,  # type: ignore[arg-type]
+            source_tensor=source_tensor,  # type: ignore[arg-type]
+            slot_index=allocation.offset // allocator.slot_size,
+            request_id="cancelled-request",
+            size=num_slots * allocator.slot_size,
+            release_cb=lambda: allocator.release(allocation.offset, num_slots),
+            fail_cb=lambda error: relay.record_stranded_slots(
+                allocator,
+                num_slots,
+                error,
+            ),
+            cancel_callback=lambda error: relay.record_stranded_slots(
+                allocator,
+                num_slots,
+                error,
+                mark_relay_failed=False,
+            ),
+            num_slots=num_slots,
+        )
+        wait_task = asyncio.create_task(operation.wait_for_completion())
+        await asyncio.sleep(0)
+        wait_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait_task
+        with pytest.raises(asyncio.CancelledError):
+            await operation.wait_for_completion()
+        return operation
+
+    with capture_comm_trace(monkeypatch) as events:
+        operation = asyncio.run(run())
+
+    layout = allocator.snapshot_layout()
+    assert layout.free_slots == 2
+    assert relay.stranded_slots_total == 2
+    assert relay.failed_error is None
+    assert operation.completed is False
+    assert operation.has_traced_cancellation is True
+    assert operation.ready_event is ready_event
+    assert operation.source_tensor is source_tensor
+    stranded = [
+        event for event in events if event["event"] == "cuda_ipc_slots_stranded"
+    ]
+    assert len(stranded) == 1
+    assert stranded[0]["engine_id"] == "sender"
+    assert stranded[0]["device"] == "cuda:0"
+    assert stranded[0]["request_id"] == "cancelled-request"
+    assert stranded[0]["slot_index"] == 0
+    assert stranded[0]["num_slots"] == 2
+    assert stranded[0]["bytes"] == 16
+    assert stranded[0]["reason"] == "CancelledError"
+    pool_state = [event for event in events if event["event"] == "cuda_ipc_pool_state"]
+    assert len(pool_state) == 1
+    assert pool_state[0]["stranded_slots_total"] == 2
 
 
 def test_cuda_ipc_relay_traces_pool_state_when_slots_are_stranded(
