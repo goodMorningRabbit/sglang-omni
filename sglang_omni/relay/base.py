@@ -112,7 +112,6 @@ class RelayOperation(ABC):
 
     def record_sender_cancellation(self, error: BaseException) -> None:
         """Record cancellation idempotently without changing resource lifecycle."""
-        pass
 
 
 class Relay(ABC):
