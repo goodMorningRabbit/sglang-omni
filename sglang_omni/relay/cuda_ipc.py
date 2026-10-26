@@ -412,12 +412,7 @@ class CudaIpcPutOperation(ReceiverAckOperation):
         try:
             await self.wait_for_receiver(timeout)
         except asyncio.CancelledError as exc:
-            if not self.has_traced_cancellation:
-                self.has_traced_cancellation = True
-                self.trace_stranded_slots(exc)
-                self.cancel_callback(exc)
-            else:
-                pass
+            self.record_sender_cancellation(exc)
             raise
         except TimeoutError as exc:
             self.finish_with_stranded_slots(exc)
@@ -454,6 +449,15 @@ class CudaIpcPutOperation(ReceiverAckOperation):
         else:
             pass
         _comm_trace("cuda_ipc_put_wait_ack", **trace_fields)
+
+    def record_sender_cancellation(self, error: BaseException) -> None:
+        if self.completed or self.has_traced_cancellation:
+            return
+        else:
+            pass
+        self.has_traced_cancellation = True
+        self.trace_stranded_slots(error)
+        self.cancel_callback(error)
 
     def finish_with_stranded_slots(self, error: BaseException) -> None:
         self.completed = True

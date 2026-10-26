@@ -1224,6 +1224,13 @@ class CommEngine:
             return pending.cleanup_requested
         except asyncio.CancelledError as exc:
             self.trace_pending_failure(object_id, pending, exc, watch_start)
+            for operation in pending.ops:
+                try:
+                    operation.record_sender_cancellation(exc)
+                except Exception:
+                    logger.exception(
+                        f"Failed to record sender cancellation for transfer {object_id!r}"
+                    )
             if pending.retain_pending_on_failure and not pending.receiver_terminal:
                 # A local failure is not proof that the peer stopped reading.
                 self.retain_pending_kv_transfer(object_id, pending, exc)

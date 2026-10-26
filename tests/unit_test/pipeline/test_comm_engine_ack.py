@@ -13,6 +13,11 @@ from sglang_omni.comm.data_ref import DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine, PendingTransfer, pending_transfer_bytes
 from sglang_omni.comm.router import CommRouter
 from sglang_omni.proto import DataAckMessage, DataReadyMessage
+from sglang_omni.relay.cuda_ipc import (
+    ContiguousSlotAllocator,
+    CudaIpcPutOperation,
+    CudaIpcRelay,
+)
 from tests.unit_test.fixtures.pipeline_fakes import (
     RecordingStageControlPlane,
     make_stage_payload,
@@ -106,6 +111,90 @@ def test_retain_pending_skips_byte_aggregation_when_tracing_is_disabled(
 
     asyncio.run(run())
     aggregate_bytes.assert_not_called()
+
+
+def test_cancel_pending_before_ack_records_cuda_ipc_slots_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        engine = CommEngine(
+            CommRouter(
+                stage_name="sender",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+            )
+        )
+        relay = CudaIpcRelay(engine_id="sender", device="cuda:0")
+        allocator = ContiguousSlotAllocator(slot_count=4, slot_size=8)
+        num_slots = 2
+        allocation = await allocator.acquire_async(num_slots)
+        ready_event = object()
+        source_tensor = object()
+        operation = CudaIpcPutOperation(
+            metadata={},
+            engine_id="sender",
+            device="cuda:0",
+            ready_event=ready_event,  # type: ignore[arg-type]
+            source_tensor=source_tensor,  # type: ignore[arg-type]
+            slot_index=allocation.offset // allocator.slot_size,
+            request_id="transfer",
+            size=num_slots * allocator.slot_size,
+            release_cb=lambda: allocator.release(allocation.offset, num_slots),
+            fail_cb=lambda error: relay.record_stranded_slots(
+                allocator,
+                num_slots,
+                error,
+            ),
+            cancel_callback=lambda error: relay.record_stranded_slots(
+                allocator,
+                num_slots,
+                error,
+                mark_relay_failed=False,
+            ),
+            num_slots=num_slots,
+        )
+        engine.register_pending("transfer", [operation])
+        pending = engine.pending["transfer"]
+        pending_task = engine.arm_pending("transfer")
+        await asyncio.sleep(0)
+        assert not pending.ack.done()
+
+        pending_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_task
+
+        layout = allocator.snapshot_layout()
+        assert layout.free_slots == 2
+        assert relay.stranded_slots_total == 2
+        assert relay.failed_error is None
+        assert operation.completed is False
+        assert operation.has_traced_cancellation is True
+        assert operation.ready_event is ready_event
+        assert operation.source_tensor is source_tensor
+        assert "transfer" not in engine.pending
+        relay.close()
+
+    with capture_comm_trace(monkeypatch) as events:
+        asyncio.run(run())
+
+    stranded = [
+        event for event in events if event["event"] == "cuda_ipc_slots_stranded"
+    ]
+    assert len(stranded) == 1
+    assert stranded[0]["engine_id"] == "sender"
+    assert stranded[0]["device"] == "cuda:0"
+    assert stranded[0]["request_id"] == "transfer"
+    assert stranded[0]["slot_index"] == 0
+    assert stranded[0]["num_slots"] == 2
+    assert stranded[0]["bytes"] == 16
+    assert stranded[0]["reason"] == "CancelledError"
+    pool_state = [event for event in events if event["event"] == "cuda_ipc_pool_state"]
+    assert len(pool_state) == 1
+    assert pool_state[0]["stranded_slots_total"] == 2
+    failed = [event for event in events if event["event"] == "comm_transfer_failed"]
+    assert len(failed) == 1
+    assert failed[0]["error"] == "CancelledError"
 
 
 class AckedRelay:
